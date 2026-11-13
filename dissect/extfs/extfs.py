@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import stat
+import warnings
 from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
@@ -93,10 +94,10 @@ class ExtFS:
         self.volume_name = sb.s_volume_name.split(b"\x00")[0].decode(errors="surrogateescape")
         self.last_mount = sb.s_last_mounted.split(b"\x00")[0].decode(errors="surrogateescape")
 
-        self.root = self.get_inode(c_ext.EXT2_ROOT_INO, "/")
-
-        self.get_inode = lru_cache(1024)(self.get_inode)
+        self._inode_cache = lru_cache(1024)(self._create_inode)
         self._read_group_desc = lru_cache(356)(self._read_group_desc)
+
+        self.root = DirectoryEntry(self.get_inode(c_ext.EXT2_ROOT_INO), "/")
 
     @cached_property
     def journal(self) -> JDB2:
@@ -110,7 +111,14 @@ class ExtFS:
         inode = self.get_inode(inum)
         return JDB2(inode.open())
 
-    def get(self, path_or_inum: str | int, node: INode | None = None) -> INode:
+    def get(self, path_or_inum: str | int, node: INode | None = None) -> INode | DirectoryEntry:
+        """Resolve a path or inode number.
+
+        An integer inode number returns the shared, cached :class:`INode`.
+        A path is resolved directory by directory and returns the
+        :class:`DirectoryEntry` carrying that path component's name; directory
+        entries delegate all inode metadata to their shared :class:`INode`.
+        """
         if isinstance(path_or_inum, int):
             return self.get_inode(path_or_inum)
 
@@ -135,10 +143,42 @@ class ExtFS:
         filename: str | None = None,
         filetype: int | None = None,
     ) -> INode:
+        """Return the cached :class:`INode` for ``inum``.
+
+        The cache key is the inode number only. Every hard link pointing at the
+        same on-disk inode therefore shares one :class:`INode` instance and its
+        parsed metadata (inode record, runlist, xattrs), regardless of the
+        directory entry through which it was reached. The cache is scoped to
+        this :class:`ExtFS` instance, mirroring the previous per-filesystem
+        cache size of 1024 entries.
+
+        The ``filename`` and ``filetype`` arguments are accepted for backwards
+        compatibility but do not participate in caching or in the inode's
+        identity. A non-default ``filename`` is ignored with a warning: names
+        belong to :class:`DirectoryEntry` objects, not to inodes. ``filetype``
+        only seeds the inode's own type hint until its on-disk inode record is
+        read; directory-entry d_type values are stored on DirectoryEntry and
+        never mutate the shared inode.
+        """
         if inum < c_ext.EXT2_BAD_INO or inum > self.sb.s_inodes_count:
             raise Error(f"inum out of range {c_ext.EXT2_BAD_INO}-{self.sb.s_inodes_count}: {inum}")
 
-        return INode(self, inum, filename, filetype)
+        if filename is not None:
+            warnings.warn(
+                "ExtFS.get_inode() no longer associates a filename with an INode; directory "
+                "names are represented by DirectoryEntry objects. The filename argument is "
+                "ignored and will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        inode = self._inode_cache(int(inum))
+        if filetype is not None:
+            inode._filetype = filetype
+        return inode
+
+    def _create_inode(self, inum: int) -> INode:
+        return INode(self, inum)
 
     def _read_group_desc(self, group_num: int) -> c_ext.ext2_group_desc | c_ext.ext4_group_desc:
         if group_num >= self.groups_count:
@@ -164,21 +204,53 @@ class ExtFS:
 
 
 class INode:
+    """A single on-disk inode, shared by every directory entry that links to it.
+
+    Identity rules:
+        An :class:`INode` is uniquely identified by the pair
+        ``(extfs, inum)``. :meth:`ExtFS.get_inode` caches on the inode number,
+        so all hard links to one inode resolve to the same :class:`INode`
+        instance and share all parsed metadata (the inode record, runlist and
+        extended attributes), which means the underlying inode block is read
+        from disk only once.
+
+        An inode has no name of its own. Names and directory-entry file types
+        are properties of :class:`DirectoryEntry` objects; the same inode can be
+        referenced by many entries, each with its own independent name.
+        Accessing :attr:`filename` on a bare inode therefore raises
+        :class:`AttributeError`; use a :class:`DirectoryEntry` (for example the
+        result of :meth:`ExtFS.get` with a path or of :meth:`iterdir`) to obtain
+        a name.
+
+        Deleting a directory entry (unlinking one hard link) does not change the
+        inode's identity or invalidate any :class:`DirectoryEntry` or
+        :class:`INode` reference already handed out. A residual reference keeps
+        pointing at the same cached inode and, for a directory entry, keeps its
+        own name; inode 0 directory entries (free/unlinked slots) are skipped
+        during directory traversal rather than returned.
+    """
+
     def __init__(
         self,
         extfs: ExtFS,
         inum: int,
-        filename: str | None = None,
         filetype: int | None = None,
     ):
         self.extfs = extfs
         self.inum = inum
-        self.filename = filename
         self._filetype = filetype
         self._runlist = None
 
     def __repr__(self) -> str:
         return f"<inode {self.inum}>"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, INode):
+            return NotImplemented
+        return self.extfs is other.extfs and self.inum == other.inum
+
+    def __hash__(self) -> int:
+        return hash((id(self.extfs), self.inum))
 
     @cached_property
     def inode(self) -> c_ext.ext4_inode:
@@ -290,12 +362,12 @@ class INode:
 
         return _parse_ns_ts(time, time_extra)
 
-    def listdir(self) -> dict[str, INode]:
-        return {node.filename: node for node in self.iterdir()}
+    def listdir(self) -> dict[str, DirectoryEntry]:
+        return {entry.filename: entry for entry in self.iterdir()}
 
     dirlist = listdir
 
-    def iterdir(self) -> Iterator[INode]:
+    def iterdir(self) -> Iterator[DirectoryEntry]:
         if self.filetype != stat.S_IFDIR:
             raise NotADirectoryError(f"{self!r} is not a directory")
 
@@ -309,7 +381,9 @@ class INode:
                 log.critical("Zero-length directory entry in %s (offset 0x%x)", self, offset)
                 return
 
-            # Sanity check if the direntry is valid
+            # Sanity check if the direntry is valid. Inode 0 marks a free
+            # directory entry (an unlinked slot) and is never yielded, so
+            # callers never get a residual reference without a backing inode.
             if 0 < direntry.inode < self.extfs.sb.s_inodes_count:
                 fname = buf.read(direntry.name_len).decode(errors="surrogateescape")
                 ftype = direntry.file_type if self.extfs._dirtype == c_ext.ext2_dir_entry_2 else None
@@ -317,7 +391,7 @@ class INode:
                 if ftype:
                     ftype = FILETYPES[ftype]
 
-                yield self.extfs.get_inode(direntry.inode, fname, ftype)
+                yield DirectoryEntry(self.extfs.get_inode(direntry.inode), fname, ftype)
 
             offset += direntry.rec_len
             buf.seek(offset)
@@ -404,6 +478,83 @@ class INode:
             buf.size = self.size
             return buf
         return RunlistStream(self.extfs.fh, self.dataruns(), self.size, self.extfs.block_size)
+
+
+class DirectoryEntry:
+    """A named directory entry pointing at a shared :class:`INode`.
+
+    Identity rules:
+        A :class:`DirectoryEntry` represents one reference (one hard link) in
+        one directory. Its identity is the combination of its backing inode,
+        its entry name and the directory it belongs to. Two directory entries
+        that link to the same inode through different paths are distinct
+        objects with independent names and directory-entry file types, but
+        delegate all inode metadata to the one shared :class:`INode`, so names
+        can never overwrite each other and the inode's on-disk record is
+        parsed once.
+
+        The ``filetype`` reported here comes from the directory entry's d_type
+        field and is stored on the entry itself; when an entry has no d_type
+        value it falls back to the shared inode's actual mode-derived type.
+
+        Directory entries are value-comparable: entries with the same backing
+        inode and name compare equal even when obtained from separate
+        :meth:`INode.iterdir` calls, while two hard links of the same inode
+        with different names compare different. Removing the entry on disk
+        does not mutate or invalidate an already obtained reference, which
+        retains its name and inode.
+    """
+
+    def __init__(self, inode: INode, filename: str, filetype: int | None = None):
+        self._inode = inode
+        self.filename = filename
+        # The directory-entry file type is per-entry metadata (the d_type field
+        # of the dirent) and is intentionally kept off the shared inode, so a
+        # hint from one path can never overwrite another path's view. When the
+        # entry carries no type it falls back to the inode's actual type.
+        self._filetype = filetype
+
+    def __repr__(self) -> str:
+        return f"<directory_entry filename={self.filename!r} inode={self._inode!r}>"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DirectoryEntry):
+            return NotImplemented
+        return self.filename == other.filename and self._inode == other._inode
+
+    def __hash__(self) -> int:
+        return hash((self.filename, self._inode))
+
+    @property
+    def inode(self) -> INode:
+        return self._inode
+
+    @property
+    def inum(self) -> int:
+        return self._inode.inum
+
+    @property
+    def extfs(self) -> ExtFS:
+        return self._inode.extfs
+
+    @property
+    def filetype(self) -> int:
+        return self._filetype if self._filetype is not None else self._inode.filetype
+
+    def listdir(self) -> dict[str, DirectoryEntry]:
+        return self._inode.listdir()
+
+    def iterdir(self) -> Iterator[DirectoryEntry]:
+        yield from self._inode.iterdir()
+
+    def __getattr__(self, attr: str) -> object:
+        # Delegate every other attribute (size, timestamps, xattr, open(),
+        # dataruns(), ...) to the shared inode so that historical code treating
+        # directory entries as inodes keeps working. The guard avoids infinite
+        # recursion when the inode is not yet set (for example during unpickle).
+        if attr == "_inode":
+            raise AttributeError(attr)
+        return getattr(self._inode, attr)
 
 
 class XAttr:
