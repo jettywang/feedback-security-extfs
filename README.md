@@ -40,6 +40,33 @@ tox
 For a more elaborate explanation on how to build and test the project, please see [the
 documentation](https://docs.dissect.tools/en/latest/contributing/tooling.html).
 
+## Encrypted directory names
+
+ext4 directories can store fscrypt-encrypted names. Without the key the raw name bytes cannot be decoded, so they
+must not be treated as ordinary paths. Use the forensic listing API to keep the evidence:
+
+```python
+from dissect.extfs import ExtFS
+
+fs = ExtFS(fh)
+
+# Ordinary directories keep the historical interface
+plain = fs.get("plain")
+print(plain.listdir())
+
+# Lossless listing: raw bytes, parent inode, byte offset and fscrypt context per entry
+for entry in fs.get("locked").iterdir_entries():
+    print(entry.entry_id, entry.raw_name, entry.path_name, entry.encryption_context.status)
+
+# A reversible index for the whole tree, including encrypted directories
+print(fs.name_index().to_json())
+```
+
+`entry.path_name` is the decoded name for ordinary entries and `fscrypt:<hex>` for names stored in an encrypted
+directory, so reports never present undecodable bytes as a normal path. Index keys are derived from the parent
+directory inode, the entry byte offset and the entry inode, so encrypted entries that share a display name remain
+distinct.
+
 ## Contributing
 
 The Dissect project encourages any contribution to the codebase. To make your contribution fit into the project, please

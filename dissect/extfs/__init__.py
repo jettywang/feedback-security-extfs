@@ -6,15 +6,28 @@ from dissect.extfs.exceptions import (
     NotADirectoryError,
     NotASymlinkError,
 )
-from dissect.extfs.extfs import ExtFS, INode
+from dissect.extfs.extfs import (
+    ENCRYPTED_NAME_PREFIX,
+    DirectoryEntry,
+    DirectoryListing,
+    ExtFS,
+    INode,
+    NameIndex,
+)
+from dissect.extfs.fscrypt import EncryptionContext
 from dissect.extfs.journal import JDB2
 
 __all__ = [
     "JDB2",
+    "ENCRYPTED_NAME_PREFIX",
+    "DirectoryEntry",
+    "DirectoryListing",
+    "EncryptionContext",
     "Error",
     "ExtFS",
     "FileNotFoundError",
     "INode",
+    "NameIndex",
     "NotADirectoryError",
     "NotASymlinkError",
 ]
