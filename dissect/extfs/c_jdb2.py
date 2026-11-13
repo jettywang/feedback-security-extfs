@@ -74,6 +74,13 @@ struct commit_header {
     uint32  h_commit_nsec;
 };
 
+struct revoke_header {
+    uint32  h_magic;
+    uint32  h_blocktype;
+    uint32  h_sequence;
+    uint32  r_count;            /* bytes used by this revoke block, incl. header */
+};
+
 struct journal_block_tag {
     uint32  t_blocknr;          /* The on-disk block number */
     uint16  t_checksum;         /* truncated crc32c(uuid+seq+block) */

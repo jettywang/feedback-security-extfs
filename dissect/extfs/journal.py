@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import io
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util.stream import RangeStream
@@ -11,6 +12,13 @@ from dissect.extfs.exceptions import Error
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+SEQUENCE_WRAP = 1 << 32
+
+
+def _sequence_delta(newer: int, older: int) -> int:
+    """Signed distance from ``older`` to ``newer`` in wrapping 32-bit sequence space."""
+    return (newer - older) % SEQUENCE_WRAP
 
 
 class JDB2:
@@ -79,9 +87,95 @@ class JDB2:
                 self.fh.seek(offset)
                 yield CommitBlock(self, c_jdb2.commit_header(self.fh), block_num)
             elif header.h_blocktype == c_jdb2.JBD2_REVOKE_BLOCK:
-                pass
+                self.fh.seek(offset)
+                yield RevokeBlock(self, c_jdb2.revoke_header(self.fh), block_num)
 
             block_num += 1
+
+    def transactions(self) -> list[Transaction]:
+        """Reconstruct the transactions contained in this journal.
+
+        Transactions are ordered by their (wrapping) commit sequence number, not by
+        physical scan order, so journals that wrap around the ring or that were
+        captured mid-transaction are handled correctly.
+        """
+        descriptors: dict[int, list[DescriptorBlock]] = {}
+        commits: dict[int, CommitBlock] = {}
+        revokes: dict[int, list[RevokeBlock]] = {}
+
+        for block in self.walk():
+            if isinstance(block, DescriptorBlock):
+                descriptors.setdefault(block.sequence, []).append(block)
+            elif isinstance(block, CommitBlock):
+                commits.setdefault(block.sequence, block)
+            elif isinstance(block, RevokeBlock):
+                revokes.setdefault(block.sequence, []).append(block)
+
+        sequences = sorted(
+            set(descriptors) | set(commits) | set(revokes),
+            key=lambda sequence: _sequence_delta(sequence, self.sb.s_sequence),
+        )
+
+        transactions = []
+        for sequence in sequences:
+            transaction = Transaction(
+                jdb2=self,
+                sequence=sequence,
+                descriptors=descriptors.get(sequence, []),
+                commit=commits.get(sequence),
+                revokes=revokes.get(sequence, []),
+            )
+            for revoke in transaction.revokes:
+                for fs_block in revoke.blocks():
+                    transaction.revoked_blocks[fs_block] = revoke.journal_block
+            transactions.append(transaction)
+
+        return transactions
+
+    def block_history(self, block: int) -> list[BlockVersion]:
+        """Return the read-only version history of filesystem ``block``.
+
+        Every candidate write found in the journal is returned, oldest committed
+        version first, each annotated with whether it is valid and the reason why
+        it is usable or excluded. A version is only valid if its transaction has a
+        commit record and the block was not revoked by that transaction.
+        """
+        versions = []
+        for transaction in self.transactions():
+            for tag in transaction.tags():
+                if tag.block != block:
+                    continue
+
+                if transaction.commit is None:
+                    valid = False
+                    reason = (
+                        f"excluded: transaction {transaction.sequence} has no commit record "
+                        "(incomplete or never committed)"
+                    )
+                elif block in transaction.revoked_blocks:
+                    valid = False
+                    reason = (
+                        f"excluded: block {block} was revoked by transaction {transaction.sequence} "
+                        f"at journal block {transaction.revoked_blocks[block]}"
+                    )
+                else:
+                    valid = True
+                    reason = f"valid: committed in transaction {transaction.sequence} and not revoked"
+
+                versions.append(
+                    BlockVersion(
+                        block=block,
+                        sequence=transaction.sequence,
+                        journal_block=tag.journal_block,
+                        commit_block=transaction.commit.journal_block if transaction.commit else None,
+                        commit_ts=transaction.commit.ts if transaction.commit else None,
+                        valid=valid,
+                        reason=reason,
+                        tag=tag,
+                    )
+                )
+
+        return versions
 
 
 class DescriptorBlock:
@@ -150,4 +244,74 @@ class CommitBlock:
         return (
             f"<commit sequence={self.sequence} journal_block={self.journal_block} "
             f"ts={self.ts} num_descriptors={len(self.descriptors)}>"
+        )
+
+
+class RevokeBlock:
+    def __init__(self, jdb2: JDB2, header: c_jdb2.revoke_header, journal_block: int):
+        self.jdb2 = jdb2
+        self.header = header
+        self.journal_block = journal_block
+
+        self.sequence = self.header.h_sequence
+
+    def __repr__(self) -> str:
+        return f"<revoke_block sequence={self.sequence} journal_block={self.journal_block}>"
+
+    def blocks(self) -> Iterator[int]:
+        """Filesystem block numbers revoked by this revoke record."""
+        self.jdb2.fh.seek((self.journal_block * self.jdb2.block_size) + c_jdb2.revoke_header.size)
+
+        offset = c_jdb2.revoke_header.size
+        entry_size = 8 if self.jdb2.sb.s_feature_incompat & c_jdb2.JBD2_FEATURE_INCOMPAT_64BIT else 4
+        while offset + entry_size <= self.header.r_count:
+            if entry_size == 8:
+                block = int.from_bytes(self.jdb2.fh.read(8), "big")
+            else:
+                block = int.from_bytes(self.jdb2.fh.read(4), "big")
+            yield block
+            offset += entry_size
+
+
+@dataclass
+class Transaction:
+    """A single journal transaction: descriptors, an optional commit and revokes."""
+
+    jdb2: JDB2
+    sequence: int
+    descriptors: list[DescriptorBlock] = field(default_factory=list)
+    commit: CommitBlock | None = None
+    revokes: list[RevokeBlock] = field(default_factory=list)
+    revoked_blocks: dict[int, int] = field(default_factory=dict)
+
+    @property
+    def committed(self) -> bool:
+        return self.commit is not None
+
+    def tags(self) -> Iterator[DescriptorBlockTag]:
+        for descriptor in self.descriptors:
+            yield from descriptor.tags()
+
+
+@dataclass
+class BlockVersion:
+    """One journaled version of a filesystem block, with its validity verdict."""
+
+    block: int
+    sequence: int
+    journal_block: int
+    commit_block: int | None
+    commit_ts: datetime.datetime | None
+    valid: bool
+    reason: str
+    tag: DescriptorBlockTag
+
+    def open(self) -> BinaryIO:
+        """Read-only view of this version's data as found in the journal."""
+        return self.tag.open()
+
+    def __repr__(self) -> str:
+        return (
+            f"<block_version block={self.block} sequence={self.sequence} "
+            f"journal_block={self.journal_block} valid={self.valid}>"
         )
