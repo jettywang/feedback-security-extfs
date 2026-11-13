@@ -333,18 +333,22 @@ class INode:
                 run_offset = 0
 
                 for extent in _parse_extents(self, buf):
-                    # Account for uninitialized extents
+                    # Account for sparse gaps. ee_block is the absolute logical block where this
+                    # extent starts, so this also realigns run_offset after extents that do not
+                    # (e.g. uninitialized extents) carry a physical run of their own.
+                    if extent.ee_block != run_offset:
+                        sparse_gap = extent.ee_block - run_offset
+                        runs.append((None, sparse_gap))
+                        run_offset += sparse_gap
+
+                    # Account for uninitialized extents. These map to logical blocks but hold no
+                    # initialized data, so expose them as sparse runs rather than reading the
+                    # stale physical data of the preallocated blocks.
                     if extent.ee_len > 0x8000:
                         uninitialized_gap = extent.ee_len - 0x8000
                         runs.append((None, uninitialized_gap))
                         run_offset += uninitialized_gap
                         continue
-
-                    # Account for sparse gaps
-                    if extent.ee_block != run_offset:
-                        sparse_gap = extent.ee_block - run_offset
-                        runs.append((None, sparse_gap))
-                        run_offset += sparse_gap
 
                     runs.append(((extent.ee_start_hi << 32) | extent.ee_start_lo, extent.ee_len))
                     run_offset += extent.ee_len
