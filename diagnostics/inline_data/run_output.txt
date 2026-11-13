@@ -1,0 +1,111 @@
+################ CURRENT dissect.extfs BEHAVIOUR ################
+============================================================================================
+VARIANT: clean  (img_none.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+
+============================================================================================
+VARIANT: xattr magic corrupted  (img_bad_magic.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  CORRUPT: Error (magic_ok=False)
+
+============================================================================================
+VARIANT: xattr value offset corrupted  (img_bad_value_offs.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=4)
+
+============================================================================================
+VARIANT: xattr entry erased  (img_entry_erased.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  xattr area empty
+
+
+################ REFERENCE (KERNEL-SEMANTICS) RECOVERY ################
+============================================================================================
+VARIANT: clean  (img_none.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+
+============================================================================================
+VARIANT: xattr magic corrupted  (img_bad_magic.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  CORRUPT: Error (magic_ok=False)
+
+============================================================================================
+VARIANT: xattr value offset corrupted  (img_bad_value_offs.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=4)
+
+============================================================================================
+VARIANT: xattr entry erased  (img_entry_erased.img)
+============================================================================================
+inode      rule                   declared read_len  head(0:60)  tail(60:)  xattr view
+fill60     INLINE_DATA_FL               60       60        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+spill61    INLINE_DATA_FL               61       60        True      False  system.data present (vsize=1, read=1)
+spill100   INLINE_DATA_FL              100       60        True      False  system.data present (vsize=40, read=40)
+shortlink  short-symlink                20       20        True        n/a  no ibody xattr (clean; parser raises on absent magic)
+corrupt    INLINE_DATA_FL              100       60        True      False  xattr area empty
+
+========================================================================================
+REFERENCE RECOVERY: clean
+  fill60     declared=  60 recovered=  60 complete=True source=i_block only             tail_bytes=0 warning=None
+  spill61    declared=  61 recovered=  61 complete=True source=i_block + system.data    tail_bytes=1 warning=None
+  spill100   declared= 100 recovered= 100 complete=True source=i_block + system.data    tail_bytes=40 warning=None
+  shortlink  declared=  20 recovered=  20 complete=True source=i_block only             tail_bytes=0 warning=None
+  corrupt    declared= 100 recovered= 100 complete=True source=i_block + system.data    tail_bytes=40 warning=None
+========================================================================================
+REFERENCE RECOVERY: xattr magic corrupted
+  fill60     declared=  60 recovered=  60 complete=True source=i_block only             tail_bytes=0 warning=None
+  spill61    declared=  61 recovered=  61 complete=True source=i_block + system.data    tail_bytes=1 warning=None
+  spill100   declared= 100 recovered= 100 complete=True source=i_block + system.data    tail_bytes=40 warning=None
+  shortlink  declared=  20 recovered=  20 complete=True source=i_block only             tail_bytes=0 warning=None
+  corrupt    declared= 100 recovered=  60 complete=False source=i_block + system.data    tail_bytes=0 warning=xattr parse error: Invalid xattr magic value
+========================================================================================
+REFERENCE RECOVERY: xattr value offset corrupted
+  fill60     declared=  60 recovered=  60 complete=True source=i_block only             tail_bytes=0 warning=None
+  spill61    declared=  61 recovered=  61 complete=True source=i_block + system.data    tail_bytes=1 warning=None
+  spill100   declared= 100 recovered= 100 complete=True source=i_block + system.data    tail_bytes=40 warning=None
+  shortlink  declared=  20 recovered=  20 complete=True source=i_block only             tail_bytes=0 warning=None
+  corrupt    declared= 100 recovered=  64 complete=False source=i_block + system.data    tail_bytes=4 warning=None
+========================================================================================
+REFERENCE RECOVERY: xattr entry erased
+  fill60     declared=  60 recovered=  60 complete=True source=i_block only             tail_bytes=0 warning=None
+  spill61    declared=  61 recovered=  61 complete=True source=i_block + system.data    tail_bytes=1 warning=None
+  spill100   declared= 100 recovered= 100 complete=True source=i_block + system.data    tail_bytes=40 warning=None
+  shortlink  declared=  20 recovered=  20 complete=True source=i_block only             tail_bytes=0 warning=None
+  corrupt    declared= 100 recovered=  60 complete=False source=i_block + system.data    tail_bytes=0 warning=system.data xattr not found
