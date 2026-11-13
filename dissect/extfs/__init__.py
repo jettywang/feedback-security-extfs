@@ -6,7 +6,7 @@ from dissect.extfs.exceptions import (
     NotADirectoryError,
     NotASymlinkError,
 )
-from dissect.extfs.extfs import ExtFS, INode
+from dissect.extfs.extfs import ExtFS, INode, XAttr, XAttrIssue, XAttrReport, XAttrSource, XAttrStatus
 from dissect.extfs.journal import JDB2
 
 __all__ = [
@@ -17,4 +17,9 @@ __all__ = [
     "INode",
     "NotADirectoryError",
     "NotASymlinkError",
+    "XAttr",
+    "XAttrIssue",
+    "XAttrReport",
+    "XAttrSource",
+    "XAttrStatus",
 ]

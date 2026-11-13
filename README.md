@@ -3,6 +3,40 @@
 A Dissect module implementing a parser for the ExtFS file system, the native filesystem for Linux operating systems. For
 more information, please see [the documentation](https://docs.dissect.tools/en/latest/projects/dissect.extfs/index.html).
 
+## Extended attributes
+
+An extended attribute (`xattr`) value can be stored in one of three places: inline in the inode's extra area, in a
+separate attribute block referenced by the inode, or in a dedicated EA inode referenced by the attribute entry.
+`INode.xattr` keeps returning a plain list of attributes, but each `XAttr` now records where its value came from and
+whether the value was read completely:
+
+```python
+from dissect.extfs import ExtFS
+
+extfs = ExtFS(fh)
+inode = extfs.get("/some/path")
+
+for xattr in inode.xattr:
+    print(xattr.name, xattr.source, xattr.status, xattr.value)
+
+# Find a specific attribute, including damaged duplicates.
+xattr = inode.get_xattr("security.capability")
+if xattr is not None and not xattr.value_complete:
+    print(xattr.issues)
+
+# Group attributes by storage location for a forensic report.
+report = inode.xattr_report()
+print(report.by_source)
+print(report.damaged)
+```
+
+`XAttr.source` is one of `XAttrSource.INODE_BODY`, `XAttrSource.EXTERNAL_BLOCK` or `XAttrSource.EA_INODE`. For EA-inode
+values, `entry_source` still records where the attribute entry itself lives. `XAttr.status` is `XAttrStatus.OK` only for
+a clean attribute; duplicate names, unknown namespaces, out-of-range value offsets, truncated inline values, short EA
+inode reads and malformed containers each have their own status and are not silently truncated into a normal value.
+Container-wide damage (for example an invalid external block magic) is reported through `INode.xattr_issues` without
+preventing other readable attributes from being returned.
+
 ## Requirements
 
 This project is part of the Dissect framework and requires Python.

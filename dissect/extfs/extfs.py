@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import enum
 import io
 import logging
 import os
 import stat
+import struct
+from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, BinaryIO
 from uuid import UUID
-
-from dissect.util import ts
-from dissect.util.stream import RangeStream, RunlistStream
 
 from dissect.extfs.c_ext import (
     EXT2,
@@ -27,6 +27,8 @@ from dissect.extfs.exceptions import (
     NotASymlinkError,
 )
 from dissect.extfs.journal import JDB2
+from dissect.util import ts
+from dissect.util.stream import RunlistStream
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -182,6 +184,11 @@ class INode:
 
     @cached_property
     def inode(self) -> c_ext.ext4_inode:
+        self.extfs.fh.seek(self.inode_offset())
+        return c_ext.ext4_inode(self.extfs.fh)
+
+    def inode_offset(self) -> int:
+        """Return the absolute byte offset of this inode record on disk."""
         block_group_num, index = divmod(self.inum - 1, self.extfs.sb.s_inodes_per_group)
         block_group = self.extfs._read_group_desc(block_group_num)
 
@@ -190,9 +197,26 @@ class INode:
         else:
             table_block = block_group.bg_inode_table_lo
 
-        offset = table_block * self.extfs.block_size + index * self.extfs.sb.s_inode_size
-        self.extfs.fh.seek(offset)
-        return c_ext.ext4_inode(self.extfs.fh)
+        return table_block * self.extfs.block_size + index * self.extfs.sb.s_inode_size
+
+    def inline_xattr_data(self) -> bytes:
+        """Return the inline extended-attribute area of this inode record.
+
+        This reads the raw on-disk bytes so the area is bounded exactly by the
+        inode's ``i_extra_isize``, independent of how cstruct models the dynamic
+        ``i_extra`` field.
+        """
+        inode_size = self.extfs.sb.s_inode_size
+        if inode_size <= 128:
+            return b""
+
+        extra_isize = self.inode.i_extra_isize
+        if extra_isize > inode_size - 128:
+            return b""
+
+        inode_offset = self.inode_offset()
+        self.extfs.fh.seek(inode_offset + 128 + extra_isize)
+        return self.extfs.fh.read(inode_size - 128 - extra_isize)
 
     @cached_property
     def size(self) -> int:
@@ -213,28 +237,55 @@ class INode:
 
     @cached_property
     def xattr(self) -> list[XAttr]:
-        xattr = []
+        """Every extended attribute that could be enumerated, including damaged ones.
 
-        if self.inode.i_extra.strip(b"\x00"):
-            buf = io.BytesIO(self.inode.i_extra)
-            hdr = c_ext.ext4_xattr_ibody_header(buf)
-            if hdr.h_magic != c_ext.EXT4_XATTR_MAGIC:
-                raise Error("Invalid xattr magic value")
+        Kept for backwards compatibility: the return type is still the same list
+        of :class:`XAttr` objects in on-disk order, and valid attributes expose
+        the same ``name`` and ``value`` as before. Use :attr:`xattr_issues` for
+        container-level parse errors and inspect each attribute's
+        :attr:`~XAttr.status` before trusting its value.
+        """
+        return self.xattrs()
 
-            xattr.extend(_iter_xattr(self, buf, len(self.inode.i_extra), 4))
+    def xattrs(self, name: str | None = None) -> list[XAttr]:
+        """Return extended attributes, optionally filtered to an exact full name.
 
-        if self.inode.i_file_acl_lo:
-            block = (self.inode.i_file_acl_high << 32) | self.inode.i_file_acl_lo
-            block_offset = block * self.extfs.block_size
+        Duplicate names are intentionally preserved: each entry carries its own
+        source, value offset and integrity status. When ``name`` is given, all
+        occurrences are returned in on-disk order. This returns a copy so callers
+        cannot corrupt the cached enumeration.
+        """
+        if not hasattr(self, "_xattrs"):
+            self._xattrs = _read_xattrs(self)
 
-            buf = RangeStream(self.extfs.fh, block_offset, self.extfs.block_size)
-            hdr = c_ext.ext4_xattr_header(buf)
-            if hdr.h_magic != c_ext.EXT4_XATTR_MAGIC:
-                raise Error("Invalid xattr magic value")
+        if name is None:
+            return list(self._xattrs)
 
-            xattr.extend(_iter_xattr(self, buf, buf.size))
+        return [xattr for xattr in self._xattrs if xattr.name == name]
 
-        return xattr
+    def get_xattr(self, name: str) -> XAttr | None:
+        """Return the first attribute with ``name``, including a damaged one."""
+        matches = self.xattrs(name)
+        return matches[0] if matches else None
+
+    def get_xattrs(self, name: str) -> list[XAttr]:
+        """Return all attributes with ``name``, preserving duplicate evidence."""
+        return self.xattrs(name)
+
+    @cached_property
+    def xattr_issues(self) -> tuple[XAttrIssue, ...]:
+        """Container-level issues encountered while enumerating extended attributes.
+
+        These describe damage to an inode-body header or an external attribute
+        block as a whole. Per-attribute damage is recorded on the individual
+        :class:`XAttr` objects instead.
+        """
+        self.xattrs()
+        return self._xattr_issues
+
+    def xattr_report(self) -> XAttrReport:
+        """Return a grouped, report-ready view of this inode's extended attributes."""
+        return XAttrReport(self, tuple(self.xattrs()), self.xattr_issues)
 
     @property
     def atime(self) -> datetime:
@@ -406,19 +457,191 @@ class INode:
         return RunlistStream(self.extfs.fh, self.dataruns(), self.size, self.extfs.block_size)
 
 
+class XAttrSource(enum.Enum):
+    """Physical location that supplies an extended attribute value."""
+
+    INODE_BODY = "inode_body"
+    EXTERNAL_BLOCK = "external_block"
+    EA_INODE = "ea_inode"
+
+
+class XAttrStatus(enum.Enum):
+    """Outcome of reading one extended attribute."""
+
+    OK = "ok"
+    INVALID_NAME = "invalid_name"
+    UNKNOWN_NAMESPACE = "unknown_namespace"
+    DUPLICATE_NAME = "duplicate_name"
+    INVALID_VALUE_OFFSET = "invalid_value_offset"
+    TRUNCATED_VALUE = "truncated_value"
+    INVALID_EA_INODE = "invalid_ea_inode"
+    TRUNCATED_EA_VALUE = "truncated_ea_value"
+    MALFORMED = "malformed"
+
+
+_STATUS_PRIORITY = {
+    XAttrStatus.OK: 0,
+    XAttrStatus.DUPLICATE_NAME: 1,
+    XAttrStatus.UNKNOWN_NAMESPACE: 2,
+    XAttrStatus.INVALID_NAME: 3,
+    XAttrStatus.TRUNCATED_EA_VALUE: 4,
+    XAttrStatus.INVALID_EA_INODE: 5,
+    XAttrStatus.TRUNCATED_VALUE: 6,
+    XAttrStatus.INVALID_VALUE_OFFSET: 7,
+    XAttrStatus.MALFORMED: 8,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class XAttrIssue:
+    """A single reason why an extended attribute could not be read cleanly."""
+
+    status: XAttrStatus
+    detail: str
+
+
+_VALUE_INCOMPLETE = frozenset(
+    {
+        XAttrStatus.INVALID_VALUE_OFFSET,
+        XAttrStatus.TRUNCATED_VALUE,
+        XAttrStatus.INVALID_EA_INODE,
+        XAttrStatus.TRUNCATED_EA_VALUE,
+        XAttrStatus.MALFORMED,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class XAttrReport:
+    """A report-ready view of an inode's extended attributes.
+
+    Attributes are grouped by their value :attr:`~XAttr.source`, and damaged
+    attributes remain in the report alongside their integrity status. A report
+    is complete when it has at least one attribute and every attribute has a
+    complete value; container-level damage is reported separately.
+    """
+
+    inode: INode
+    attributes: tuple[XAttr, ...]
+    container_issues: tuple[XAttrIssue, ...]
+
+    @property
+    def by_source(self) -> dict[XAttrSource, list[XAttr]]:
+        result: dict[XAttrSource, list[XAttr]] = {source: [] for source in XAttrSource}
+        for attribute in self.attributes:
+            result[attribute.source].append(attribute)
+        return result
+
+    @property
+    def damaged(self) -> list[XAttr]:
+        """Attributes whose value could not be read completely."""
+        return [attribute for attribute in self.attributes if not attribute.value_complete]
+
+    @property
+    def anomalous(self) -> list[XAttr]:
+        """Attributes with any issue, including naming and duplicate anomalies."""
+        return [attribute for attribute in self.attributes if not attribute.ok]
+
+    @property
+    def complete(self) -> bool:
+        """Whether every reported attribute has a complete value."""
+        return not self.damaged
+
+
 class XAttr:
-    def __init__(self, extfs: ExtFS, inode: INode, entry: c_ext.ext4_xattr_entry, value: bytes):
+    """One extended attribute, with provenance and per-attribute integrity state.
+
+    Attributes are represented even when they could not be read completely.
+    ``value`` contains exactly the bytes that were readable, or ``None`` when the
+    value could not be located at all. Check :attr:`value_complete` before
+    consuming :attr:`value`; an incomplete value must not be treated as a clean
+    value. :attr:`ok` is stricter and is ``False`` for naming or duplicate
+    anomalies as well.
+
+    :attr:`source` records where the value bytes came from:
+    :attr:`XAttrSource.INODE_BODY` for the inode's inline area,
+    :attr:`XAttrSource.EXTERNAL_BLOCK` for a referenced attribute block and
+    :attr:`XAttrSource.EA_INODE` for an out-of-line value stored in another
+    inode. The entry that describes an EA-inode value still lives in an inode
+    body or external block; :attr:`entry_source` records that location, while
+    :attr:`eainode` and :attr:`eainode_inum` identify the value inode.
+    """
+
+    def __init__(
+        self,
+        extfs: ExtFS,
+        inode: INode,
+        entry: c_ext.ext4_xattr_entry,
+        value: bytes | None,
+        source: XAttrSource,
+        status: XAttrStatus = XAttrStatus.OK,
+        issues: tuple[XAttrIssue, ...] = (),
+        *,
+        entry_source: XAttrSource | None = None,
+        entry_offset: int | None = None,
+        value_offset: int | None = None,
+        eainode: INode | None = None,
+    ):
         self.extfs = extfs
         self.inode = inode
         self.entry = entry
 
-        self.prefix = XATTR_PREFIX_MAP.get(entry.e_name_index, "unknown_prefix")
-        self._name = XATTR_NAME_MAP.get(entry.e_name_index, entry.e_name.decode(errors="surrogateescape"))
-        self.name = self.prefix + self._name
+        self.namespace_index = entry.e_name_index
+        self.raw_name = bytes(entry.e_name)
+        self._name = XATTR_NAME_MAP.get(entry.e_name_index, self.raw_name.decode(errors="surrogateescape"))
+        self.prefix = XATTR_PREFIX_MAP.get(entry.e_name_index)
+        self.name = self._name if self.prefix is None else self.prefix + self._name
         self.value = value
 
+        self.source = source
+        self.entry_source = entry_source if entry_source is not None else source
+        self.status = status
+        self.issues = issues
+        self.entry_offset = entry_offset
+        self.value_offset = value_offset
+        self.value_size = entry.e_value_size
+        self.eainode = eainode
+
+        self.e_value_inum = entry.e_value_inum
+        self.e_value_offs = entry.e_value_offs
+        self.e_value_size = entry.e_value_size
+
+    @property
+    def namespace_known(self) -> bool:
+        """Whether the namespace index is one of the known ext4 indexes."""
+        return self.prefix is not None
+
+    @property
+    def value_complete(self) -> bool:
+        """Whether every byte declared by the entry was read from a valid location.
+
+        This is ``True`` for complete values even if the name is unknown or
+        duplicated; use :attr:`issues` to inspect those anomalies. It is derived
+        from the issues rather than the aggregate status so a value problem is
+        never hidden by a naming or duplicate problem.
+        """
+        return not any(issue.status in _VALUE_INCOMPLETE for issue in self.issues)
+
+    @property
+    def complete(self) -> bool:
+        """Alias for :attr:`value_complete`."""
+        return self.value_complete
+
+    @property
+    def ok(self) -> bool:
+        """Whether the attribute is entirely clean, including naming and duplicates."""
+        return self.status == XAttrStatus.OK
+
+    @property
+    def eainode_inum(self) -> int | None:
+        """Inode number holding an out-of-line value, if any."""
+        return None if self.eainode is None else self.eainode.inum
+
     def __repr__(self) -> str:
-        return f"<xattr name={self.name} value={self.value} inode={self.inode}>"
+        return (
+            f"<xattr name={self.name} source={self.source.value} status={self.status.value} "
+            f"value={self.value!r} inode={self.inode}>"
+        )
 
 
 def _parse_indirect(inode: INode, offset: int, num_blocks: int, level: int) -> list[int]:
@@ -468,30 +691,353 @@ def _parse_extents(inode: INode, buf: bytes) -> Iterator[c_ext.ext4_extent]:
             yield from _parse_extents(inode, blockbuf)
 
 
-def _iter_xattr(inode: INode, buf: BinaryIO, end: int, value_offset: int = 0) -> Iterator[XAttr]:
-    offset = buf.tell()
-    while True:
-        try:
-            if offset > end:
-                break
+def _read_xattrs(inode: INode) -> list[XAttr]:
+    """Read all extended attributes for ``inode``, isolating per-attribute damage."""
+    xattrs: list[XAttr] = []
+    issues: list[XAttrIssue] = []
+    seen_names: dict[tuple[int, bytes], tuple[XAttrSource, int]] = {}
 
-            buf.seek(offset)
-            entry = c_ext.ext4_xattr_entry(buf)
+    containers = [
+        (XAttrSource.INODE_BODY, _inode_body_container(inode, issues)),
+        (XAttrSource.EXTERNAL_BLOCK, _external_block_container(inode, issues)),
+    ]
 
-            if (entry.e_name_len, entry.e_name_index, entry.e_value_offs) == (0, 0, 0):
-                break
+    for source, container in containers:
+        if container is None:
+            continue
 
-            if entry.e_value_inum:
-                value = inode.extfs.get_inode(entry.e_value_inum).open().read(entry.e_value_size)
-            else:
-                buf.seek(value_offset + entry.e_value_offs)
-                value = buf.read(entry.e_value_size)
+        data, value_base, entries_offset = container
+        xattrs.extend(_parse_xattr_container(inode, data, value_base, entries_offset, source, seen_names, issues))
 
-            yield XAttr(inode.extfs, inode, entry, value)
+    inode._xattr_issues = tuple(issues)
+    return xattrs
 
-            offset += (len(entry) + c_ext.EXT4_XATTR_ROUND) & (~c_ext.EXT4_XATTR_ROUND & 0xFFFFFFFF)
-        except EOFError:
+
+def _inode_body_container(inode: INode, issues: list[XAttrIssue]) -> tuple[bytes, int, int] | None:
+    # A 128-byte inode has no extra area, so anything beyond its end is the next
+    # inode's data rather than an inode-body xattr header.
+    if inode.extfs.sb.s_inode_size <= 128:
+        return None
+
+    extra = inode.inline_xattr_data()
+    if not extra or not extra.strip(b"\x00"):
+        return None
+
+    if len(extra) < 4:
+        issues.append(XAttrIssue(XAttrStatus.MALFORMED, "Truncated inode-body xattr header"))
+        return None
+
+    magic = struct.unpack_from("<I", extra, 0)[0]
+    if magic != c_ext.EXT4_XATTR_MAGIC:
+        issues.append(XAttrIssue(XAttrStatus.MALFORMED, f"Invalid inode-body xattr magic: 0x{magic:08x}"))
+        return None
+
+    # Inline values are addressed relative to the byte after the header.
+    return extra, 4, 4
+
+
+def _external_block_container(inode: INode, issues: list[XAttrIssue]) -> tuple[bytes, int, int] | None:
+    block = (inode.inode.i_file_acl_high << 32) | inode.inode.i_file_acl_lo
+    if not block:
+        return None
+
+    if block > inode.extfs.last_block:
+        issues.append(
+            XAttrIssue(
+                XAttrStatus.MALFORMED,
+                f"External xattr block {block} exceeds last block {inode.extfs.last_block}",
+            )
+        )
+        return None
+
+    block_offset = block * inode.extfs.block_size
+    inode.extfs.fh.seek(block_offset)
+    data = inode.extfs.fh.read(inode.extfs.block_size)
+    if len(data) < inode.extfs.block_size:
+        issues.append(
+            XAttrIssue(
+                XAttrStatus.MALFORMED,
+                f"Truncated external xattr block {block}: read {len(data)} of {inode.extfs.block_size} bytes",
+            )
+        )
+    if len(data) < 4:
+        return None
+
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != c_ext.EXT4_XATTR_MAGIC:
+        issues.append(
+            XAttrIssue(
+                XAttrStatus.MALFORMED,
+                f"Invalid external xattr block magic at block {block}: 0x{magic:08x}",
+            )
+        )
+        return None
+
+    # The external block has a full 32-byte header before the first entry.
+    return data, 0, 32
+
+
+def _iter_xattr_entries(
+    data: bytes, entries_offset: int, source: XAttrSource, issues: list[XAttrIssue]
+) -> Iterator[tuple[int, int, int, int, int, bytes]]:
+    """Yield ``(offset, name_len, name_index, value_offs, value_inum, value_size)`` tuples.
+
+    Stops cleanly at the end marker. A malformed entry is reported once and does
+    not prevent earlier entries from being returned.
+    """
+    end = len(data)
+    offset = entries_offset
+
+    while offset + 16 <= end:
+        name_len, name_index, value_offs, value_inum, value_size, _hash = struct.unpack_from("<BBHIII", data, offset)
+
+        if (name_len, name_index, value_offs) == (0, 0, 0):
             break
+
+        entry_size = (16 + name_len + c_ext.EXT4_XATTR_ROUND) & ~c_ext.EXT4_XATTR_ROUND
+        next_offset = offset + entry_size
+
+        if next_offset > end:
+            issues.append(
+                XAttrIssue(
+                    XAttrStatus.MALFORMED,
+                    f"Xattr entry at offset 0x{offset:x} in {source.value} extends past its container",
+                )
+            )
+            break
+
+        yield offset, name_len, name_index, value_offs, value_inum, value_size
+        offset = next_offset
+
+
+def _parse_xattr_container(
+    inode: INode,
+    data: bytes,
+    value_base: int,
+    entries_offset: int,
+    source: XAttrSource,
+    seen_names: dict[tuple[int, bytes], tuple[XAttrSource, int]],
+    issues: list[XAttrIssue],
+) -> list[XAttr]:
+    xattrs: list[XAttr] = []
+
+    entries = list(_iter_xattr_entries(data, entries_offset, source, issues))
+    if not entries:
+        return xattrs
+
+    last_offset, last_name_len = entries[-1][0], entries[-1][1]
+    last_entry_end = last_offset + ((16 + last_name_len + c_ext.EXT4_XATTR_ROUND) & ~c_ext.EXT4_XATTR_ROUND)
+    # The entry array ends with one all-zero 4-byte terminator; values follow it.
+    entry_table_end = last_entry_end + 4
+
+    for offset, name_len, name_index, value_offs, value_inum, value_size in entries:
+        entry_size = (16 + name_len + c_ext.EXT4_XATTR_ROUND) & ~c_ext.EXT4_XATTR_ROUND
+        buf = io.BytesIO(data[offset : offset + entry_size])
+        try:
+            entry = c_ext.ext4_xattr_entry(buf)
+        except EOFError:
+            issues.append(
+                XAttrIssue(
+                    XAttrStatus.MALFORMED,
+                    f"Truncated xattr entry at offset 0x{offset:x} in {source.value}",
+                )
+            )
+            continue
+
+        entry_issues: list[XAttrIssue] = []
+
+        if name_len > len(entry.e_name):
+            entry_issues.append(
+                XAttrIssue(
+                    XAttrStatus.INVALID_NAME,
+                    f"Declared name length {name_len} exceeds available {len(entry.e_name)}",
+                )
+            )
+
+        if name_index not in XATTR_PREFIX_MAP:
+            entry_issues.append(
+                XAttrIssue(
+                    XAttrStatus.UNKNOWN_NAMESPACE,
+                    f"Unknown namespace index {name_index}",
+                )
+            )
+
+        if value_inum:
+            value, value_offset, value_issues, eainode = _read_ea_inode_value(inode, entry)
+            value_source = XAttrSource.EA_INODE
+        else:
+            value, value_offset, value_issues = _read_inline_value(
+                data, value_base, entry_table_end, value_offs, value_size, len(data)
+            )
+            value_source = source
+            eainode = None
+        entry_issues.extend(value_issues)
+
+        name_key = (name_index, bytes(entry.e_name))
+        if name_key in seen_names:
+            previous_source, previous_offset = seen_names[name_key]
+            entry_issues.append(
+                XAttrIssue(
+                    XAttrStatus.DUPLICATE_NAME,
+                    f"Duplicate name {bytes(entry.e_name)!r} in namespace {name_index}; first seen "
+                    f"in {previous_source.value} at offset 0x{previous_offset:x}",
+                )
+            )
+        else:
+            seen_names[name_key] = (source, offset)
+
+        status = XAttrStatus.OK
+        if entry_issues:
+            status = max((issue.status for issue in entry_issues), key=_STATUS_PRIORITY.__getitem__)
+
+        xattrs.append(
+            XAttr(
+                inode.extfs,
+                inode,
+                entry,
+                value,
+                value_source,
+                status,
+                tuple(entry_issues),
+                entry_source=source,
+                entry_offset=offset,
+                value_offset=value_offset,
+                eainode=eainode,
+            )
+        )
+
+    return xattrs
+
+
+def _read_inline_value(
+    data: bytes, value_base: int, entry_start: int, value_offs: int, value_size: int, end: int
+) -> tuple[bytes | None, int | None, list[XAttrIssue]]:
+    value_offset = value_base + value_offs
+
+    # A zero-length value has no location to validate; the offset field is unused.
+    if value_size == 0:
+        return b"", None, []
+
+    if value_offset >= end:
+        return (
+            None,
+            value_offset,
+            [
+                XAttrIssue(
+                    XAttrStatus.INVALID_VALUE_OFFSET,
+                    f"Value offset {value_offset} is outside container of size {end}",
+                )
+            ],
+        )
+
+    # Values must be stored after the entry table; an offset pointing back into
+    # the entries or header is corrupt and must not be reported as a clean value.
+    if value_offset < entry_start:
+        return (
+            None,
+            value_offset,
+            [
+                XAttrIssue(
+                    XAttrStatus.INVALID_VALUE_OFFSET,
+                    f"Value offset {value_offset} points into the entry area ending at {entry_start}",
+                )
+            ],
+        )
+
+    available = end - value_offset
+    if value_size > available:
+        return (
+            data[value_offset:end],
+            value_offset,
+            [
+                XAttrIssue(
+                    XAttrStatus.TRUNCATED_VALUE,
+                    f"Value needs {value_size} bytes but only {available} remain",
+                )
+            ],
+        )
+
+    return data[value_offset : value_offset + value_size], value_offset, []
+
+
+def _read_ea_inode_value(
+    inode: INode, entry: c_ext.ext4_xattr_entry
+) -> tuple[bytes | None, int | None, list[XAttrIssue], INode | None]:
+    if entry.e_value_inum < c_ext.EXT2_BAD_INO or entry.e_value_inum > inode.extfs.sb.s_inodes_count:
+        return (
+            None,
+            None,
+            [
+                XAttrIssue(
+                    XAttrStatus.INVALID_EA_INODE,
+                    f"EA inode number {entry.e_value_inum} is outside "
+                    f"{c_ext.EXT2_BAD_INO}-{inode.extfs.sb.s_inodes_count}",
+                )
+            ],
+            None,
+        )
+
+    try:
+        eainode = inode.extfs.get_inode(entry.e_value_inum)
+    except (Error, EOFError) as e:
+        return (
+            None,
+            None,
+            [XAttrIssue(XAttrStatus.INVALID_EA_INODE, f"Unable to load EA inode {entry.e_value_inum}: {e}")],
+            None,
+        )
+
+    if not entry.e_value_size:
+        return b"", None, [], eainode
+
+    available = eainode.size
+    if entry.e_value_size > available:
+        try:
+            value = eainode.open().read(available)
+        except (Error, EOFError) as e:
+            return (
+                None,
+                None,
+                [XAttrIssue(XAttrStatus.TRUNCATED_EA_VALUE, f"Unable to read EA inode {eainode.inum}: {e}")],
+                eainode,
+            )
+
+        return (
+            value,
+            None,
+            [
+                XAttrIssue(
+                    XAttrStatus.TRUNCATED_EA_VALUE,
+                    f"EA inode {eainode.inum} holds {available} bytes but the attribute needs {entry.e_value_size}",
+                )
+            ],
+            eainode,
+        )
+
+    try:
+        value = eainode.open().read(entry.e_value_size)
+    except (Error, EOFError) as e:
+        return (
+            None,
+            None,
+            [XAttrIssue(XAttrStatus.INVALID_EA_INODE, f"Unable to read EA inode {eainode.inum}: {e}")],
+            eainode,
+        )
+
+    if len(value) < entry.e_value_size:
+        return (
+            value,
+            None,
+            [
+                XAttrIssue(
+                    XAttrStatus.TRUNCATED_EA_VALUE,
+                    f"EA inode {eainode.inum} returned {len(value)} of {entry.e_value_size} bytes",
+                )
+            ],
+            eainode,
+        )
+
+    return value, None, [], eainode
 
 
 def _parse_ns_ts(time: int, time_extra: int) -> int:
