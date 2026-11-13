@@ -23,6 +23,7 @@ from dissect.extfs.c_ext import (
 from dissect.extfs.exceptions import (
     Error,
     FileNotFoundError,
+    MissingDataError,
     NotADirectoryError,
     NotASymlinkError,
 )
@@ -322,88 +323,143 @@ class INode:
             offset += direntry.rec_len
             buf.seek(offset)
 
-    def dataruns(self) -> list[tuple[int | None, int]]:
-        if not self._runlist:
-            expected_runs = (self.size + self.extfs.block_size - 1) // self.extfs.block_size
+    def dataruns(self, offset: int | None = None, size: int | None = None) -> list[tuple[int | None, int]]:
+        """Return the data runs of this inode, optionally limited to a file-relative byte range.
 
-            if self.inode.i_flags & c_ext.EXT4_EXTENTS_FL:
-                buf = io.BytesIO(self.inode.i_block)
+        Called without arguments this returns the runs for the entire file, like it always did.
+        When ``offset`` and/or ``size`` are given, only the runs covering the blocks that intersect
+        ``[offset, offset + size)`` are returned. The first returned run then corresponds to the
+        block containing ``offset``, i.e. block ``offset // block_size``. For files using indirect
+        block addressing (ext2/ext3) only the indirect blocks required for the requested range are
+        read from the image, instead of the entire indirect block tree.
 
-                runs = []
-                run_offset = 0
+        Raises:
+            MissingDataError: If the image is incomplete and (part of) the indirect blocks needed
+                for the requested range are missing. The exception carries the actual missing
+                file-relative byte intervals.
+        """
+        if offset is None and size is None:
+            if not self._runlist:
+                self._runlist = self._dataruns()
+            return self._runlist
 
-                for extent in _parse_extents(self, buf):
-                    # Account for uninitialized extents
-                    if extent.ee_len > 0x8000:
-                        uninitialized_gap = extent.ee_len - 0x8000
-                        runs.append((None, uninitialized_gap))
-                        run_offset += uninitialized_gap
-                        continue
+        offset = max(0, min(self.size, offset or 0))
+        end = self.size if size is None else min(self.size, offset + max(0, size))
+        if end <= offset:
+            return []
 
-                    # Account for sparse gaps
-                    if extent.ee_block != run_offset:
-                        sparse_gap = extent.ee_block - run_offset
-                        runs.append((None, sparse_gap))
-                        run_offset += sparse_gap
+        block_size = self.extfs.block_size
+        first_block = offset // block_size
+        num_blocks = (end - 1) // block_size - first_block + 1
 
-                    runs.append(((extent.ee_start_hi << 32) | extent.ee_start_lo, extent.ee_len))
-                    run_offset += extent.ee_len
+        if self.inode.i_flags & c_ext.EXT4_EXTENTS_FL:
+            return _slice_runs(self.dataruns(), first_block, num_blocks)
+        return self._dataruns_indirect(first_block, num_blocks)
 
-                if run_offset < expected_runs:
-                    runs.append((None, expected_runs - run_offset))
+    def _dataruns(self) -> list[tuple[int | None, int]]:
+        expected_runs = (self.size + self.extfs.block_size - 1) // self.extfs.block_size
 
-                self._runlist = runs
-            else:
-                i_blocks = c_ext.uint32[15](self.inode.i_block)
-                num_blocks = (self.size + self.extfs.block_size - 1) // self.extfs.block_size
-                num_direct_blocks = min(num_blocks, c_ext.EXT2_NDIR_BLOCKS)
+        if self.inode.i_flags & c_ext.EXT4_EXTENTS_FL:
+            buf = io.BytesIO(self.inode.i_block)
 
-                blocks = i_blocks[:num_direct_blocks]
-                num_blocks -= num_direct_blocks
+            runs = []
+            run_offset = 0
 
-                if num_blocks > 0:
-                    for level in range(c_ext.EXT2_NIND_BLOCKS):
-                        indirect_offset = i_blocks[num_direct_blocks + level]
-                        parsed_blocks = _parse_indirect(self, indirect_offset, num_blocks, level + 1)
-                        num_blocks -= len(parsed_blocks)
-                        blocks.extend(parsed_blocks)
+            for extent in _parse_extents(self, buf):
+                # Account for uninitialized extents
+                if extent.ee_len > 0x8000:
+                    uninitialized_gap = extent.ee_len - 0x8000
+                    runs.append((None, uninitialized_gap))
+                    run_offset += uninitialized_gap
+                    continue
 
-                        if num_blocks == 0:
-                            break
+                # Account for sparse gaps
+                if extent.ee_block != run_offset:
+                    sparse_gap = extent.ee_block - run_offset
+                    runs.append((None, sparse_gap))
+                    run_offset += sparse_gap
 
-                runs = []
-                if blocks:
-                    run_offset = None
-                    run_size = 1
+                runs.append(((extent.ee_start_hi << 32) | extent.ee_start_lo, extent.ee_len))
+                run_offset += extent.ee_len
 
-                    for block in blocks:
-                        if run_offset is None:
-                            run_offset = block
-                            continue
+            if run_offset < expected_runs:
+                runs.append((None, expected_runs - run_offset))
 
-                        if block == run_offset + run_size:
-                            run_size += 1
-                        else:
-                            if run_offset == 0:
-                                runs.append((None, run_size))
-                            else:
-                                runs.append((run_offset, run_size))
-                            run_offset = block
-                            run_size = 1
+            return runs
 
-                    runs.append((run_offset, run_size))
+        return self._dataruns_indirect(0, expected_runs)
 
-                self._runlist = runs
+    def _dataruns_indirect(self, first_block: int, num_blocks: int) -> list[tuple[int | None, int]]:
+        extfs = self.extfs
+        offsets_per_block = extfs.block_size // 4
+        i_blocks = c_ext.uint32[15](self.inode.i_block)
 
-        return self._runlist
+        end_block = first_block + num_blocks
+        blocks = []
+        missing = []
 
-    def open(self) -> BinaryIO:
+        if first_block < c_ext.EXT2_NDIR_BLOCKS:
+            direct_count = min(end_block, c_ext.EXT2_NDIR_BLOCKS) - first_block
+            blocks.extend(i_blocks[first_block : first_block + direct_count])
+
+        base = c_ext.EXT2_NDIR_BLOCKS
+        for level in range(1, c_ext.EXT2_NIND_BLOCKS + 1):
+            if end_block <= base:
+                break
+
+            capacity = offsets_per_block**level
+            if first_block < base + capacity:
+                sub_first = max(first_block, base) - base
+                sub_count = min(end_block, base + capacity) - base - sub_first
+                offset = i_blocks[c_ext.EXT2_NDIR_BLOCKS + level - 1]
+                blocks.extend(_parse_indirect(self, offset, sub_first, sub_count, level, base, missing))
+
+            base += capacity
+
+        if missing:
+            intervals = []
+            for block, count in sorted(missing):
+                start = block * extfs.block_size
+                end = min(start + count * extfs.block_size, self.size)
+                if intervals and intervals[-1][1] >= start:
+                    intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+                else:
+                    intervals.append((start, end))
+            missing_intervals = [(start, end - start) for start, end in intervals]
+            raise MissingDataError(
+                f"Image is missing data for {self!r} at file-relative intervals (offset, size): {missing_intervals}",
+                missing_intervals,
+            )
+
+        return _blocks_to_runs(blocks)
+
+    def open(self, offset: int = 0, size: int | None = None) -> BinaryIO:
+        """Open this inode as a stream, optionally limited to a file-relative byte range.
+
+        Called without arguments this returns a stream over the entire file, like it always did.
+        When ``offset`` and/or ``size`` are given, the returned stream only spans
+        ``[offset, offset + size)`` (clamped to the file size). For files using indirect block
+        addressing (ext2/ext3) only the indirect blocks required for that range are read.
+        """
         if self.inode.i_flags & c_ext.EXT4_INLINE_DATA_FL or (self.filetype == stat.S_IFLNK and self.size < 60):
-            buf = io.BytesIO(memoryview(self.inode.i_block)[: self.size])
+            offset = max(0, min(self.size, offset))
+            end = self.size if size is None else min(self.size, offset + max(0, size))
+            buf = io.BytesIO(memoryview(self.inode.i_block)[offset:end])
             # Need to add a size attribute to maintain compatibility with dissect streams
-            buf.size = self.size
+            buf.size = end - offset
             return buf
-        return RunlistStream(self.extfs.fh, self.dataruns(), self.size, self.extfs.block_size)
+
+        if offset == 0 and size is None:
+            return RunlistStream(self.extfs.fh, self.dataruns(), self.size, self.extfs.block_size)
+
+        offset = max(0, min(self.size, offset))
+        end = self.size if size is None else min(self.size, offset + max(0, size))
+        size = end - offset
+
+        block_size = self.extfs.block_size
+        runs = self.dataruns(offset, size)
+        stream = RunlistStream(self.extfs.fh, runs, sum(count for _, count in runs) * block_size, block_size)
+        return RangeStream(stream, offset % block_size, size)
 
 
 class XAttr:
@@ -421,30 +477,113 @@ class XAttr:
         return f"<xattr name={self.name} value={self.value} inode={self.inode}>"
 
 
-def _parse_indirect(inode: INode, offset: int, num_blocks: int, level: int) -> list[int]:
-    offsets_per_block = inode.extfs.block_size // 4
+def _parse_indirect(
+    inode: INode,
+    offset: int,
+    first_block: int,
+    num_blocks: int,
+    level: int,
+    base: int = 0,
+    missing: list[tuple[int, int]] | None = None,
+) -> list[int]:
+    """Parse ``num_blocks`` logical blocks, starting at ``first_block``, from an indirect block tree.
+
+    Args:
+        inode: The inode the indirect block tree belongs to.
+        offset: The block number of the root of this (sub)tree. ``0`` means a sparse (null) pointer.
+        first_block: The first logical block to parse, relative to this (sub)tree.
+        num_blocks: The amount of logical blocks to parse.
+        level: The indirection level of this (sub)tree (1 = single, 2 = double, 3 = triple).
+        base: The file-relative logical block number of this (sub)tree's first logical block.
+        missing: Optional list to collect ``(block, count)`` tuples (relative to ``base``) for
+            indirect blocks that cannot be read from an incomplete image. When ``None``, the
+            ``EOFError`` is propagated instead.
+
+    Returns:
+        A list of block numbers, one per requested logical block. Sparse blocks are ``0``.
+    """
+    extfs = inode.extfs
+    offsets_per_block = extfs.block_size // 4
+    max_level_blocks = offsets_per_block**level
+
+    read_blocks = min(num_blocks, max_level_blocks - first_block)
+    if read_blocks <= 0:
+        return []
+
+    # A null pointer at any level means the entire (sub)tree is sparse
+    if offset == 0:
+        return [0] * read_blocks
 
     if level == 1:
-        read_blocks = min(num_blocks, offsets_per_block)
-        if offset == 0:
+        extfs.fh.seek(offset * extfs.block_size + first_block * 4)
+        try:
+            return list(c_ext.uint32[read_blocks](extfs.fh))
+        except EOFError:
+            if missing is None:
+                raise
+            missing.append((base + first_block, read_blocks))
             return [0] * read_blocks
-        inode.extfs.fh.seek(offset * inode.extfs.block_size)
-        return c_ext.uint32[read_blocks](inode.extfs.fh)
+
+    blocks_per_nest = max_level_blocks // offsets_per_block
+    first_entry = first_block // blocks_per_nest
+    last_entry = (first_block + read_blocks - 1) // blocks_per_nest
+
+    extfs.fh.seek(offset * extfs.block_size + first_entry * 4)
+    try:
+        entries = c_ext.uint32[last_entry - first_entry + 1](extfs.fh)
+    except EOFError:
+        if missing is None:
+            raise
+        missing.append((base + first_block, read_blocks))
+        return [0] * read_blocks
 
     blocks = []
-
-    max_level_blocks = offsets_per_block**level
-    blocks_per_nest = max_level_blocks // offsets_per_block
-    read_blocks = (num_blocks + blocks_per_nest - 1) // blocks_per_nest
-    read_blocks = min(read_blocks, offsets_per_block)
-
-    inode.extfs.fh.seek(offset * inode.extfs.block_size)
-    for addr in c_ext.uint32[read_blocks](inode.extfs.fh):
-        parsed_blocks = _parse_indirect(inode, addr, num_blocks, level - 1)
-        num_blocks -= len(parsed_blocks)
-        blocks.extend(parsed_blocks)
+    for index, addr in enumerate(entries):
+        entry_start = (first_entry + index) * blocks_per_nest
+        sub_start = max(first_block, entry_start)
+        sub_first = sub_start - entry_start
+        sub_count = min(first_block + read_blocks, entry_start + blocks_per_nest) - sub_start
+        blocks.extend(_parse_indirect(inode, addr, sub_first, sub_count, level - 1, base + entry_start, missing))
 
     return blocks
+
+
+def _blocks_to_runs(blocks: list[int]) -> list[tuple[int | None, int]]:
+    """Convert a list of block numbers (``0`` marks a sparse block) to a runlist."""
+    runs = []
+    for block in blocks:
+        run_block = block if block != 0 else None
+        if runs:
+            prev_block, prev_size = runs[-1]
+            if prev_block is None and run_block is None:
+                runs[-1] = (None, prev_size + 1)
+                continue
+            if prev_block is not None and run_block is not None and prev_block + prev_size == run_block:
+                runs[-1] = (prev_block, prev_size + 1)
+                continue
+        runs.append((run_block, 1))
+    return runs
+
+
+def _slice_runs(runs: list[tuple[int | None, int]], first_block: int, num_blocks: int) -> list[tuple[int | None, int]]:
+    """Slice a runlist to the block range ``[first_block, first_block + num_blocks)``."""
+    result = []
+    pos = 0
+    end_block = first_block + num_blocks
+
+    for run_block, run_size in runs:
+        run_start = pos
+        pos += run_size
+
+        if pos <= first_block or run_start >= end_block:
+            continue
+
+        start = max(run_start, first_block)
+        end = min(pos, end_block)
+        block = None if run_block is None else run_block + (start - run_start)
+        result.append((block, end - start))
+
+    return result
 
 
 def _parse_extents(inode: INode, buf: bytes) -> Iterator[c_ext.ext4_extent]:

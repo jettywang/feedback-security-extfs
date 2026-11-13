@@ -3,6 +3,7 @@ from __future__ import annotations
 from dissect.extfs.exceptions import (
     Error,
     FileNotFoundError,
+    MissingDataError,
     NotADirectoryError,
     NotASymlinkError,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "ExtFS",
     "FileNotFoundError",
     "INode",
+    "MissingDataError",
     "NotADirectoryError",
     "NotASymlinkError",
 ]
