@@ -134,3 +134,8 @@ required-imports = ["from __future__ import annotations"]
 include = ["dissect.*"]
 
 [tool.setuptools_scm]
+
+[tool.pytest.ini_options]
+markers = [
+    "jbd2_gap(category, reason): known JBD2 reader gap. category is 'parse_misalignment' or 'unsupported_format'.",
+]
